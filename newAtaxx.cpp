@@ -9,11 +9,33 @@
 #include <queue>
 #include <random>
 #include <omp.h>
+#include <map> // For std::map
+#include <sstream> // For std::stringstream
+
 using namespace std;
 
 // ----------------------------
 // Ataxx 程序的全局变量及函数
 // ----------------------------
+
+//-----------------------------
+// 用来做决策的全局变量
+
+    // 记录每个节点的统计信息，用于 UCB 计算
+    struct NodeStats {
+        int visits = 0;
+        double totalScore = 0.0;
+    };
+
+    // 用于跟踪每次模拟的状态
+    struct SimulationState {
+        int grid[7][7];
+        int blackCount;
+        int whiteCount;
+        int currentPlayer;
+        int depth;
+    };
+//-------------------------------
 int winnerbot = 0;         // 胜利方
 int totalPieces = 0;          // 棋盘上棋子总数
 int blackPieceCount = 2, whitePieceCount = 2;
@@ -42,8 +64,15 @@ const int POSITION_WEIGHT[7][7] = {
 inline bool inMap(int x, int y) {
     return x >= 0 && x < 7 && y >= 0 && y < 7;
 }
+// ----------------------------
+// Move struct definition
+struct Move {
+    int x0, y0, x1, y1;
+    Move(int startX, int startY, int endX, int endY) : x0(startX), y0(startY), x1(endX), y1(endY) {}
+};
 
 // ----------------------------
+// 动态位置权重类（部分保持原有实现）
 // 动态位置权重类（部分保持原有实现）
 struct DynamicPositionWeight {
     int weights[7][7];
@@ -393,23 +422,17 @@ int countOpponentThreats(int color) {
 // 全局用于遗传优化的参数（待进化参数）
 double g_pieceScoreFactor = 22.2316;
 double g_mobilityFactor = 2.0002;
-double g_cornerFactor = 5.23451;
 double g_connectivityFactor = 3.03559;
 double g_threatFactor = 6.7919;
-double g_stabilityFactor = 4.99147;
 double g_captureFactor = 5.38024;
-double g_PositionFactor = 2.3951;
 
 // 通过个体基因更新全局参数
 void setGlobalParameters(const vector<double>& genes) {
     g_pieceScoreFactor = genes[0];
     g_mobilityFactor = genes[1];
-    g_cornerFactor = genes[2];
-    g_connectivityFactor = genes[3];
-    g_threatFactor = genes[4];
-    g_stabilityFactor = genes[5];
-    g_captureFactor = genes[6];
-    g_PositionFactor = genes[7];
+    g_connectivityFactor = genes[2];
+    g_threatFactor = genes[3];
+    g_captureFactor = genes[4];
 }
 
 // 为自对奕设计的简化评估函数（使用全局参数）
@@ -424,17 +447,17 @@ double EvaluateSim(int color) {
     score += g_mobilityFactor * (myMoves - oppMoves);
     const int corners[4][2] = { {0,0}, {0,6}, {6,0}, {6,6} };
     int cornerScore = 0;
-    for (int i = 0; i < 4; i++) {
-        int x = corners[i][0], y = corners[i][1];
-        if (gridInfo[x][y] == color)
-            cornerScore += 10;
-        else if (gridInfo[x][y] == -color)
-            cornerScore -= 10;
-    }
-    score += g_cornerFactor * cornerScore;
+    // for (int i = 0; i < 4; i++) {
+    //     int x = corners[i][0], y = corners[i][1];
+    //     if (gridInfo[x][y] == color)
+    //         cornerScore += 10;
+    //     else if (gridInfo[x][y] == -color)
+    //         cornerScore -= 10;
+    // }
+    //score += g_cornerFactor * cornerScore;
     score += g_connectivityFactor * countConnectedPieces(color);
     score -= g_threatFactor * countOpponentThreats(color);
-    score += g_stabilityFactor * countStablePieces(color);
+    //score += g_stabilityFactor * countStablePieces(color);
     return score;
 }
 
@@ -509,8 +532,6 @@ int evaluateMoveType(int x0, int y0, int x1, int y1, int color)
         moveScore -= g_captureFactor * ((blackPieceCount-whitePieceCount) == 0 ? 1 : abs(blackPieceCount-whitePieceCount));
     }
     
-    moveScore += POSITION_WEIGHT[x1][y1] * g_PositionFactor;
-    
     int formingTriangle = 0;
     bool hasDirection[8] = {false};
     for (int dir = 0; dir < 8; dir++)
@@ -534,22 +555,89 @@ int evaluateMoveType(int x0, int y0, int x1, int y1, int color)
     return moveScore;
 }
 
-// 修改后的蒙特卡洛模拟函数，currBotColor 参数为当前走子者颜色
-int MonteCarloSimulation(int startX, int startY, int resultX, int resultY, int simulations, int currBotColor) {
+// ----------------------------------一些优化---------------------------------
+string hashState(const SimulationState& state){
+    stringstream ss;
+    for(int y = 0; y<7; y++){
+        for(int x = 0; x < 7; x++){
+            ss << state.grid[x][y] + 1;
+        }
+    }
+    ss << ":" << state.currentPlayer;
+    return ss.str();
+}
+
+// 优化之后的决策选择
+pair< pair<int, int> ,pair<int, int> > selectBestMove(
+    const vector<pair< pair<int, int>, pair<int, int> > >& moves,
+    const SimulationState& state,
+    map<string, NodeStats>& nodeStats,
+    int alpha, int beta, int currBotColor){
+
+
+    const double EXPLORATION_PARAM = 1.414;
+    int bestMoveIdx = 0;
+    double bestScore = state.currentPlayer == currBotColor ? -__DBL_MAX__ : __DBL_MAX__;
+    for (size_t i = 0; i < moves.size(); i++){
+        // 创建模拟状态
+        SimulationState nextState = state;
+        
+        auto [fromPos, toPos] = moves[i];
+        int x0 = fromPos.first, y0 = fromPos.second;
+        int x1 = toPos.first, y1 = toPos.second;
+
+        ProcStep(x0, y0, x1, y1, currBotColor);
+        
+        string HashState = hashState(nextState);
+        auto stats = nodeStats[HashState];
+
+        // UCB优化
+
+        double exploitation = stats.visits == 0 ? 0 : stats.totalScore / stats.visits;
+        double exploration = stats.visits == 0? 10000 :
+            EXPLORATION_PARAM * sqrt(log(state.depth + 1 / stats.visits));
+
+        double ucbScore;
+        if (state.currentPlayer == currBotColor){
+            //我方最大UCB
+            ucbScore = exploitation + exploration;
+            if(ucbScore > bestScore){
+                bestScore = ucbScore;
+                bestMoveIdx = i;
+                alpha = max(alpha, (int)ucbScore);
+                if(beta <= alpha) break;
+            }
+
+        }
+        else{
+            // 对方最小ucb
+            ucbScore = exploitation - exploration;
+
+            // minimax逻辑
+            if(ucbScore < bestScore){
+                bestScore = ucbScore;
+                bestMoveIdx = i;
+                beta = min(beta, (int)ucbScore);
+                if (beta <= alpha) break;
+            }
+        }
+    }
+
+    return moves[bestMoveIdx];
+}
+
+
+// 优化后的蒙特卡洛模拟函数
+int OptimizedMonteCarloSimulation(int startX, int startY, int resultX, int resultY, int simulations, int currBotColor) {
     int wins = 0;
     int originalGrid[7][7];
     int originalBlack = blackPieceCount, originalWhite = whitePieceCount;
-    
+
     memcpy(originalGrid, gridInfo, sizeof(gridInfo));
-    
+
     // 先执行当前走法
     ProcStep(startX, startY, resultX, resultY, currBotColor);
-    
-    // 使用新的评估函数计算初始分数，并加入走法类型评估
-    int initialScore = (int)EvaluateSim(currBotColor);
-    int moveTypeScore = evaluateMoveType(startX, startY, resultX, resultY, currBotColor);
-    initialScore += moveTypeScore;
-    
+
     totalPieces = blackPieceCount + whitePieceCount;
     int maxDepth = 30;
     if (totalPieces > 35) {
@@ -558,150 +646,105 @@ int MonteCarloSimulation(int startX, int startY, int resultX, int resultY, int s
     } else if (totalPieces < 10) {
         maxDepth = 60;
     }
-    
+
     for (int i = 0; i < simulations; i++) {
-        int simGrid[7][7];
-        int simBlack = blackPieceCount, simWhite = whitePieceCount;
-        memcpy(simGrid, gridInfo, sizeof(simGrid));
+        SimulationState state;
+        memcpy(state.grid, gridInfo, sizeof(state.grid));
+        state.blackCount = blackPieceCount;
+        state.whiteCount = whitePieceCount;
+        state.currentPlayer = -currBotColor; // 对手回合
+        state.depth = 0;
 
-        int currentColor = -currBotColor; // 对手回合
-        bool gameOver = false;
-        int steps = 0;
+        map<string, NodeStats> nodeStats; // 使用字符串哈希表示局面
 
-        while (!gameOver && steps < maxDepth) {
-            vector<pair<pair<int, int>, pair<int, int>>> moves;
-            vector<int> moveScores;
+        while (state.depth < maxDepth) {
+            // 生成所有合法走法
+            vector<pair<pair<int, int>, pair<int, int> > > moves;
+            int alpha = INT_MIN, beta = INT_MAX;
 
-            // 枚举当前局面下 currentColor 的所有合法走法（使用 simGrid 进行模拟）
             for (int y0 = 0; y0 < 7; y0++) {
                 for (int x0 = 0; x0 < 7; x0++) {
-                    if (simGrid[x0][y0] == currentColor) {
+                    if (state.grid[x0][y0] == state.currentPlayer) {
                         for (int dir = 0; dir < 24; dir++) {
                             int x1 = x0 + delta[dir][0];
                             int y1 = y0 + delta[dir][1];
-                            if (inMap(x1, y1) && simGrid[x1][y1] == 0) {
-                                int tempGrid[7][7];
-                                int tempBlack = simBlack, tempWhite = simWhite;
-                                memcpy(tempGrid, simGrid, sizeof(simGrid));
-
-                                int dx = abs(x0 - x1), dy = abs(y0 - y1);
-                                if (dx == 2 || dy == 2)
-                                    tempGrid[x0][y0] = 0;
-                                else if (currentColor == 1)
-                                    tempBlack++;
-                                else
-                                    tempWhite++;
-
-                                tempGrid[x1][y1] = currentColor;
-                                int currCount = 0;
-                                for (int dir2 = 0; dir2 < 8; dir2++) {
-                                    int x = x1 + delta[dir2][0];
-                                    int y = y1 + delta[dir2][1];
-                                    if (!inMap(x, y))
-                                        continue;
-                                    if (tempGrid[x][y] == -currentColor) {
-                                        currCount++;
-                                        tempGrid[x][y] = currentColor;
-                                    }
-                                }
-                                if (currCount != 0) {
-                                    if (currentColor == 1) {
-                                        tempBlack += currCount;
-                                        tempWhite -= currCount;
-                                    } else {
-                                        tempWhite += currCount;
-                                        tempBlack -= currCount;
-                                    }
-                                }
-                                int score = 0;
-                                score += 5 * (currentColor == 1 ? (tempBlack - tempWhite) : (tempWhite - tempBlack));
-                                score += POSITION_WEIGHT[x1][y1] * (currentColor == currBotColor ? 1 : -1);
-                                
+                            if (inMap(x1, y1) && state.grid[x1][y1] == 0) {
                                 moves.push_back({{x0, y0}, {x1, y1}});
-                                moveScores.push_back(score);
                             }
                         }
                     }
                 }
             }
-            
+
             if (moves.empty()) {
-                currentColor = -currentColor;
-                gameOver = IsGameOver();
-                steps++;
+                state.currentPlayer = -state.currentPlayer;
+                state.depth++;
+
+                if (IsGameOver()) {
+                    break;
+                }
                 continue;
             }
-            
-            int choice = 0;
-            // 80% 概率选择评分最优走法，20% 概率随机选择以增加探索性
-            if (rand() % 10 < 8) {
-                if (currentColor == currBotColor)
-                    choice = max_element(moveScores.begin(), moveScores.end()) - moveScores.begin();
-                else
-                    choice = min_element(moveScores.begin(), moveScores.end()) - moveScores.begin();
-            } else {
-                choice = rand() % moves.size();
-            }
-            
-            auto move = moves[choice];
-            int dx = abs(move.first.first - move.second.first);
-            int dy = abs(move.first.second - move.second.second);
-            if (dx == 2 || dy == 2)
-                simGrid[move.first.first][move.first.second] = 0;
-            else if (currentColor == 1)
-                simBlack++;
-            else
-                simWhite++;
-            simGrid[move.second.first][move.second.second] = currentColor;
-            int captureCount = 0;
-            for (int adjDir = 0; adjDir < 8; adjDir++) {
-                int x = move.second.first + delta[adjDir][0];
-                int y = move.second.second + delta[adjDir][1];
-                if (!inMap(x, y))
-                    continue;
-                if (simGrid[x][y] == -currentColor) {
-                    captureCount++;
-                    simGrid[x][y] = currentColor;
-                }
-            }
-            if (captureCount != 0) {
-                if (currentColor == 1) {
-                    simBlack += captureCount;
-                    simWhite -= captureCount;
-                } else {
-                    simWhite += captureCount;
-                    simBlack -= captureCount;
-                }
-            }
-            
-            currentColor = -currentColor;
-            steps++;
-            gameOver = (simBlack == 0 || simWhite == 0) || (steps >= maxDepth);
+
+            // 选择最佳走法
+            // auto bestMove = moves[0];
+            // int bestScore = INT_MIN;
+            // for (auto& move : moves) {
+            //     int x0 = move.first.first, y0 = move.first.second;
+            //     int x1 = move.second.first, y1 = move.second.second;
+
+            //     // 模拟走法
+            //     int tempGrid[7][7];
+            //     memcpy(tempGrid, state.grid, sizeof(tempGrid));
+            //     int tempBlack = state.blackCount, tempWhite = state.whiteCount;
+
+            //     ProcStep(x0, y0, x1, y1, state.currentPlayer, true);
+
+            //     // 评估当前局面
+            //     int score = evaluateMoveType(x0, y0, x1, y1, state.currentPlayer);
+            //     score += EvaluateSim(state.currentPlayer);
+
+            //     if (score > bestScore) {
+            //         bestScore = score;
+            //         bestMove = move;
+            //     }
+
+            //     // 恢复局面
+            //     memcpy(state.grid, tempGrid, sizeof(tempGrid));
+            //     state.blackCount = tempBlack;
+            //     state.whiteCount = tempWhite;
+            // }
+
+            // 更新的选择方法 
+            auto bestMove = selectBestMove(moves, state, nodeStats, alpha, beta, currBotColor);
+            auto [fromPos, toPos] = bestMove;
+
+            // 执行走法
+            int x0 = fromPos.first, y0 = fromPos.second;
+            int x1 = toPos.first, y1 = toPos.second;
+            ProcStep(x0, y0, x1, y1, state.currentPlayer);
+
+            // 切换玩家
+            state.currentPlayer = -state.currentPlayer;
+            state.depth++;
         }
-        int finalScore = (currBotColor == 1) ? (simBlack - simWhite) : (simWhite - simBlack);
+
+        // 评估最终局面
+        int finalScore = (currBotColor == 1) ? 
+            (state.blackCount - state.whiteCount) : 
+            (state.whiteCount - state.blackCount);
+
         if (finalScore > 0)
             wins++;
     }
-    
+
     // 恢复原始状态
     memcpy(gridInfo, originalGrid, sizeof(gridInfo));
     blackPieceCount = originalBlack;
     whitePieceCount = originalWhite;
-    
-    totalPieces = blackPieceCount + whitePieceCount;
-    float evalWeight = 0.4;
-    if (totalPieces < 15)
-        evalWeight = 0.3;
-    else if (totalPieces > 30)
-        evalWeight = 0.6;
-    
-    if (totalPieces >= 15 && totalPieces < 35)
-        return wins + int(evalWeight * initialScore) + moveTypeScore * 3;
-    
-    return wins + int(evalWeight * initialScore) + moveTypeScore;
-}
 
-struct Move { int x0, y0, x1, y1; };
+    return wins;
+}
 
 // 简单的游戏模拟：双方轮流使用 decideMove() 选择走法，直至游戏结束
 // 返回 1 表示黑胜，0 表示白胜，0.5 表示平局
@@ -765,10 +808,10 @@ double simulateGame(const vector<double>& paramBlack, const vector<double>& para
         int simulations = 100; // 默认模拟次数
         int totalPieces = blackPieceCount + whitePieceCount;
         if (totalPieces > 35)
-            simulations = 500;
+            simulations = 150;
         // 对于当前走法，传入当前走子者颜色作为 currBotColor
         for (auto &m : legalMoves) {
-            int score = MonteCarloSimulation(m.x0, m.y0, m.x1, m.y1, simulations, currentColor);
+            int score = OptimizedMonteCarloSimulation(m.x0, m.y0, m.x1, m.y1, simulations, currentColor);
             if (score > bestScore) {
                 bestScore = score;
                 bestMove = m;
@@ -835,14 +878,11 @@ double randomDouble(double minVal, double maxVal) {
 vector<double> defaultParams = {
     20.0, // g_pieceScoreFactor
     3.0,  // g_mobilityFactor
-    1.0,  // g_cornerFactor
     3.0,  // g_connectivityFactor
     5.0,  // g_threatFactor
-    2.0,  // g_stabilityFactor
     5.0,  // g_captureFactor
-    1.0   // g_PositionFactor
 };
-vector<double> winner{g_pieceScoreFactor, g_mobilityFactor, g_cornerFactor, g_connectivityFactor, g_threatFactor, g_stabilityFactor, g_captureFactor, g_PositionFactor};
+vector<double> winner{g_pieceScoreFactor, g_mobilityFactor,  g_connectivityFactor, g_threatFactor, g_captureFactor};
 
 random_device rd;
 normal_distribution<double> dist(0.0, 2.0); // 均值0，标准差2的正态分布
@@ -911,8 +951,7 @@ void evaluatePopulation(vector<Individual>& population) {
         }
         population[i].fitness = evaluateIndividual(population[i], opponents, 1);
         cout << "gene:" << population[i].genes[0] << " " << population[i].genes[1] << " " << population[i].genes[2] << " "
-             << population[i].genes[3] << " " << population[i].genes[4] << " " << population[i].genes[5] << " "
-             << population[i].genes[6] << " " << population[i].genes[7] << endl;
+             << population[i].genes[3] << " " << population[i].genes[4] << endl;
         cout << "fitness:" << population[i].fitness << " " << endl;
     }
 }
@@ -997,12 +1036,10 @@ int main() {
         Individual parent2 = population[1];
         cout << "parent1 fitness: " << parent1.fitness << endl;
         cout << "parent1 gene: " << parent1.genes[0] << " " << parent1.genes[1] << " " << parent1.genes[2] << " "
-             << parent1.genes[3] << " " << parent1.genes[4] << " " << parent1.genes[5] << " "
-             << parent1.genes[6] << " " << parent1.genes[7] << endl;
+             << parent1.genes[3] << " " << parent1.genes[4] << endl;
         cout << "parent2 fitness: " << parent2.fitness << endl;
         cout << "parent2 gene: " << parent2.genes[0] << " " << parent2.genes[1] << " " << parent2.genes[2] << " "
-             << parent2.genes[3] << " " << parent2.genes[4] << " " << parent2.genes[5] << " "
-             << parent2.genes[6] << " " << parent2.genes[7] << endl;
+             << parent2.genes[3] << " " << parent2.genes[4] << endl;
 
         // 用child补全剩余的个体
         while (newPopulation.size() < offspringCount) {
@@ -1019,8 +1056,7 @@ int main() {
             cout << "fitness: " << ind.fitness << " ";
             cout << "基因: ";
             cout << ind.genes[0] << " " << ind.genes[1] << " " << ind.genes[2] << " "
-                 << ind.genes[3] << " " << ind.genes[4] << " " << ind.genes[5] << " "
-                 << ind.genes[6] << " " << ind.genes[7] << endl;
+                 << ind.genes[3] << " " << ind.genes[4] << " " << endl;
         }
         population = newPopulation;
 
@@ -1035,9 +1071,6 @@ int main() {
         cout << "CornerFactor: " << bestIt->genes[2] << endl;
         cout << "ConnectivityFactor: " << bestIt->genes[3] << endl;
         cout << "ThreatFactor: " << bestIt->genes[4] << endl;
-        cout << "StabilityFactor: " << bestIt->genes[5] << endl;
-        cout << "CaptureFactor: " << bestIt->genes[6] << endl;
-        cout << "PositionFactor: " << bestIt->genes[7] << endl;
     }
     
     evaluatePopulation(population);
@@ -1051,9 +1084,6 @@ int main() {
     cout << "CornerFactor: " << bestIt->genes[2] << endl;
     cout << "ConnectivityFactor: " << bestIt->genes[3] << endl;
     cout << "ThreatFactor: " << bestIt->genes[4] << endl;
-    cout << "StabilityFactor: " << bestIt->genes[5] << endl;
-    cout << "CaptureFactor: " << bestIt->genes[6] << endl;
-    cout << "PositionFactor: " << bestIt->genes[7] << endl;
     
     return 0;
 }
