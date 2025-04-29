@@ -171,7 +171,6 @@ PositionFactor: 1.55627
 
 好了现在我发现一个非常大的问题,就是蒙特卡洛算法有很大的问题,现在修改的评估函数,是作为蒙特卡洛算法当中的初始参数!! 对棋局的影响非常少
 
-
 4.3晚间对蒙特卡洛搜索做了简单的修改,把蒙特卡洛当中的评估函数放到了正确的位置,放到服务器上运行,一方面作为速度尝试,另一方面也是想算出一代参数,查看是否可以使用.
 
 4.4早10点, 在服务器上运行了10h,只运行了153把对局,没有达到预期,并且还开了多线程模拟,所以现在的算法非常耗时并且低效,原先的版本4h112把,慢了将近1/2,这也非常正常,因为把评估函数挪到了循环内部,每一次循环都会进行评估,慢了好多.
@@ -207,13 +206,13 @@ pair< pair<int, int> ,pair<int, int> > selectBestMove(
     for (size_t i = 0; i < moves.size(); i++){
         // 创建模拟状态
         SimulationState nextState = state;
-        
+
         auto [fromPos, toPos] = moves[i];
         int x0 = fromPos.first, y0 = fromPos.second;
         int x1 = toPos.first, y1 = toPos.second;
 
         ProcStep(x0, y0, x1, y1, currBotColor);
-        
+
         string HashState = hashState(nextState);
         auto stats = nodeStats[HashState];
 
@@ -377,5 +376,371 @@ int OptimizedMonteCarloSimulation(int startX, int startY, int resultX, int resul
 
 > **note:** 但是这样如果剪不好我觉得会出现一种问题,就是有可能会把当前步数次优,但是总体最优的结果提前剪枝,陷入局部最优解,后续还需要再研究..
 
-
 ## 放弃蒙特卡洛了,使用了negamax算法,准备接入神经网络..
+
+## 发现好像上传到公开仓库不好, 就当作个人日志记录, 最后上传吧..
+
+### 4.6 使用negamax算法大胜利
+
+使用negamax算法, 深度为5, 感觉比之前的使用蒙特卡洛模拟的效果好了不止一点两点, 接下来准备采用神经网络, 截止到目前,需要优化的点有:
+
+1. evaluate函数(目前只有一个子力差, 后续想要再更改)
+
+2. 剪枝, 想办法挤出时间搜第6层
+
+3. 考虑把evaluate换成神经网络, 查找了一下要求的pdf, 要换成价值神经网络, 并且需要用cpp手搓
+
+关键代码如下:
+
+``` cpp
+int negamax(U64 board, U64 active, int depth, int alpha, int beta, U64 &outB, U64 &outA) {
+    if (depth == 0) {
+        return evaluate(board, active);
+    }
+    vector<pair<U64,U64>> moves;
+    generate_moves(board, active, moves);
+    int bestScore = INT_MIN;
+    U64 bestB = board, bestA = active;
+    for (auto &mv : moves) {
+        U64 nb = mv.first, na = mv.second;
+        int score = -negamax(~nb & FULL_MASK, na, depth-1, -beta, -alpha, outB, outA);
+        if (score > bestScore) {
+            bestScore = score;
+            bestB = nb;
+            bestA = na;
+        }
+        alpha = max(alpha, score);
+        if (alpha >= beta) break;
+    }
+    outB = bestB;
+    outA = bestA;
+    return bestScore;
+}
+```
+
+
+
+### 4.11 神经网络有进展
+
+神经网络有进展, 已经放到电脑上跑模型了, 不知道效果怎么样, 使用了三层神经网络, 粗略跑出的模型会犯蠢, 可能是训练量不够导致的..
+
+现在存在的问题:
+
+1. 神经网络的优化
+
+2. 尽可能的压缩时间
+
+现阶段把所有精力都放到神经网络的优化上..
+
+## 使用启发式进行试验, 效果可以, 可以搜到第六层了
+
+### 4.19 放弃使用神经网络和修改evaluate函数
+
+这两个都会导致犯蠢, 放弃, 寻找别的方法, 现在还观察到一个现象 -- 会在終局被人翻盘, 前期优势领先, 但在最终的处理上欠缺, 想办法弥补这一点..
+
+需要完成的事:
+
+1. 评估函数是否还可以再优化? ( 之前用了遗传算法来优化评估函数, 尝试再次使用来优化 )
+
+2. 如何解决終局犯蠢问题? 
+   
+   * 这里我用的方式是这样的:
+     
+     ``` cpp
+     int evaluate(U64 board, U64 active) {
+         int my_pieces = __builtin_popcountll(board & active);
+         int opp_pieces = __builtin_popcountll((~board) & active);
+     
+         // 基本子力差
+         int score = (my_pieces - opp_pieces);
+     
+         if (my_pieces + opp_pieces >= 46 && my_pieces > opp_pieces) {
+             score -= (49 - my_pieces - opp_pieces) * 5;
+         }
+         
+         return score;
+     }
+     ```
+     
+     即在終局最后3个子时, 如果我方更优, 则尽可能的推进游戏进程到结束, 测试过后发现可行..但是好像打别人不如原有bot(H3an[5])
+
+### 4.21 发现了一种方式
+
+在我浏览chess wiki的时候发现了一种方法, 好像可以加强这种能力, 仅仅套用它的模板好像不可以, 我在找一种方式把它融入到 Ataxx当中
+
+网站: [Quiescence Search - Chessprogramming wiki](https://www.chessprogramming.org/Quiescence_Search)
+
+网站提供的伪代码:
+
+```
+int Quiesce( int alpha, int beta ) {
+    int stand_pat = Evaluate();
+    int best_value = stand_pat;
+    if( stand_pat >= beta )
+        return stand_pat;
+    if( alpha < stand_pat )
+        alpha = stand_pat;
+
+    until( every_capture_has_been_examined )  {
+        MakeCapture();
+        score = -Quiesce( -beta, -alpha );
+        TakeBackMove();
+
+        if( score >= beta )
+            return score;
+        if( score > best_value )
+            best_value = score;
+        if( score > alpha )
+            alpha = score;
+    }
+
+    return best_value;
+}
+```
+
+乍一看与普通的搜索无异,但是这个安静局面对于終局来说可太重要了,我感觉加上之后性能会增强, 明天尝试融入岛Ataxx当中
+
+
+
+> 现存问题:
+> 
+> 1. quiescence search 的Ataxx融入
+> 
+> 2. 压缩时间(钟姐在做)
+
+### 4.22 成功!!
+
+已经成功把quiescence search 融入到了Ataxx当中
+
+之前照着写没有成功的原因是因为这个源代码是用来处理国际象棋当中的局势翻转问题的, 而同化棋在中盘的变数过大, 会导致程序陷入无限递归, 从而无法到达"寂静"状态(无翻转), 搞明白这个问题之后, 加入一个深度限制就好了, 目前添加的是2层, 无超时现象, 可用..
+
+源代码如下:
+
+```cpp
+// 寂静搜索 (只搜索会引起翻转的着法)
+int quiescence_search(U64 board, U64 active, int alpha, int beta, int qdepth) {
+    // 到达寂静搜索的最大深度或棋盘已满
+    if (qdepth == 0 || __builtin_popcountll(active) == MAX_CELLS) {
+        return evaluate(board, active);
+    }
+
+    int stand_pat = evaluate(board, active); // 静态评估
+
+    // 立即剪枝优化：如果静态评估已经超出beta，直接返回
+    if (stand_pat >= beta) return beta;
+    if (stand_pat > alpha) alpha = stand_pat;
+
+    U64 mycells = board & active;
+    U64 empty_cells = FULL_MASK & ~active;
+    U64 opp_active_before = (~board) & active; // 对手棋子(活跃的)
+    
+    // 使用vector<pair<U64, U64>> 直接存储可能的局面，不再存坐标
+    vector<pair<U64, U64>> noisy_moves;
+    noisy_moves.reserve(128); // 预分配空间以减少重新分配的次数
+    
+    // 直接生成所有移动，并筛选出嘈杂着法
+    // Clone moves
+    for (U64 piece_pos = mycells; piece_pos; piece_pos &= piece_pos - 1) {
+        int from_idx = __builtin_ctzll(piece_pos);
+        U64 targets = clonemask[from_idx] & empty_cells;
+        for (U64 target_pos = targets; target_pos; target_pos &= target_pos - 1) {
+            int to_idx = __builtin_ctzll(target_pos);
+            U64 nb = board | (1ULL<<to_idx) | clonemask[to_idx];
+            U64 na = active | (1ULL<<to_idx);
+            // 检查是否有翻转发生
+            U64 opp_active_after = (~nb) & na;
+            if (__builtin_popcountll(opp_active_after) < __builtin_popcountll(opp_active_before)) {
+                noisy_moves.emplace_back(nb, na);
+            }
+        }
+    }
+    
+    // Jump moves
+    for (U64 piece_pos = mycells; piece_pos; piece_pos &= piece_pos - 1) {
+        int from_idx = __builtin_ctzll(piece_pos);
+        U64 targets = jumpmask[from_idx] & empty_cells;
+        for (U64 target_pos = targets; target_pos; target_pos &= target_pos - 1) {
+            int to_idx = __builtin_ctzll(target_pos);
+            U64 nb = board | (1ULL<<to_idx) | clonemask[to_idx];
+            U64 na = (active | (1ULL<<to_idx)) & ~(1ULL<<from_idx);
+            // 检查是否有翻转发生
+            U64 opp_active_after = (~nb) & na;
+            if (__builtin_popcountll(opp_active_after) < __builtin_popcountll(opp_active_before)) {
+                noisy_moves.emplace_back(nb, na);
+            }
+        }
+    }
+
+    // 如果没有嘈杂着法，直接返回当前估值
+    if (noisy_moves.empty()) {
+        return stand_pat;
+    }
+
+    // 对嘈杂着法进行简单排序 (翻转数量多的优先)
+    sort(noisy_moves.begin(), noisy_moves.end(), [&](const auto& a, const auto& b){
+        U64 opp_active_a = (~a.first) & a.second;
+        U64 opp_active_b = (~b.first) & b.second;
+        // Less opponent pieces after move means more flips caused by that move
+        return __builtin_popcountll(opp_active_a) < __builtin_popcountll(opp_active_b);
+    });
+
+    // 限制搜索的着法数量，只考虑最有可能的N个着法
+    const int MAX_NOISY_MOVES = 10; // 只考虑最佳的10个嘈杂着法
+    int move_count = min((int)noisy_moves.size(), MAX_NOISY_MOVES);
+
+    for (int i = 0; i < move_count; i++) {
+        auto &mv = noisy_moves[i];
+        U64 nb = mv.first, na = mv.second;
+        // 递归调用寂静搜索
+        int score = -quiescence_search(~nb & FULL_MASK, na, -beta, -alpha, qdepth - 1);
+
+        if (score >= beta) return beta;
+        if (score > alpha) alpha = score;
+    }
+
+    return alpha;
+}
+```
+
+
+
+---
+
+补写: 好吧高兴太早了, 在大部分时候会超时, 有概率不超时, 不超时的情况下非常厉害, 不过我还是很满意这次优化.
+
+### 4.24 一个修改和一些思考
+
+我不想过早的添加时间限制, 我想自己优化到正常情况下不会超时, 再添加时间限制防止比赛超时,如果过早的添加时间限制, 就无法判断这个算法的优劣, 如果这样的话还不如不加, 太烂了.
+
+添加了一个傻瓜剪枝, 在倒数第二层的时候提前evalue, 判断它是不是傻子 -- 现有分数+8(下一步最大翻转8个,创造子力差8分), 如果下一步爆种都无法拯救这一步, 那也没必要进入寂静搜索了.
+
+优化部分如下:
+
+``` cpp
+int negamax(U64 board, U64 active, int depth, int alpha, int beta, U64 &outB, U64 &outA) {
+    if (depth == 0) {
+        return quiescence_search(board, active, alpha, beta, 1);
+    }
+
+//-------------------新增优化部分-----------------------------
+
+    if (depth <= fool_check) {
+        int stand = evaluate(board, active);
+        if (stand + best_choice <= alpha) return alpha;
+    }
+
+//----------------------------------------------------------
+    vector<pair<U64,U64>> moves;
+    generate_moves(board, active, moves);
+    int bestScore = INT_MIN;
+    U64 bestB = board, bestA = active;
+    for (auto &mv : moves) {
+        U64 nb = mv.first, na = mv.second;
+        int score = -negamax(~nb & FULL_MASK, na, depth-1, -beta, -alpha, outB, outA);
+        if (score > bestScore) {
+            bestScore = score;
+            bestB = nb;
+            bestA = na;
+        }
+        alpha = max(alpha, score);
+        if (alpha >= beta) break;
+    }
+    outB = bestB;
+    outA = bestA;
+    return bestScore;
+}
+
+```
+
+
+
+分数设置+8主要还是防止局部最优, 如果分数设置的较少, 确实可以剪掉很多, 但是会出现局部最优的情况, 我不喜欢这种方式, 所以舍弃掉了之前的启发式修改, 那这里也不会允许局部最优的出现.
+
+目前存在的问题是有些情况下会超时,超时的输入如下:
+
+```
+14
+-1 -1 -1 -1
+0 0 0 1
+0 6 0 5
+0 1 0 2
+0 5 1 5
+0 2 0 3
+0 5 2 4
+0 3 1 4
+0 6 2 5
+0 2 1 3
+1 5 0 4
+2 4 1 2
+1 5 2 3
+0 0 2 2
+1 4 3 3
+0 3 1 4
+3 3 2 4
+0 1 1 1
+1 4 1 5
+2 2 3 4
+1 3 2 2
+0 1 2 1
+2 3 3 2
+2 5 0 5
+2 1 0 1
+3 4 4 3
+6 0 4 2
+```
+
+方便复制
+
+超时的这一把, 在测试的情况下, 进入最后一层的节点有70w+, 加入剪枝之后的节点有50w, 效果还是比较显著的, 不超时了, 但是后续会超时, 目前估算的depth == 2时超时阈值为60w左右
+
+将depth改为1之后, 不超时了, 虽然不甘心, 但是目前的办法好像只有这样修改了.
+
+> 目前需要做的:
+> 
+> 1. 超时问题的修改(钟姐提出全部使用bitboard计算, 这个我看不懂, 交给她最后优化, 否则会比较麻烦)
+> 
+> 2. 尽量避免陷入局部最优的剪枝
+
+---
+
+我的一个想法:
+
+在计算的时候发现, 有一把超时的局面, 叶子节点数为200w, 倒数第二层节点数为20w, 由于搜索树指数型增长的特点, 我觉得可以在最后一层做排序, 引入启发式剪枝, 这样可以最大程度上的避免局部最优, 考虑全局
+
+**tips:** 把depth修改为1之后, 有一把搜索100w未超时, 认为100w以内是安全的区间, 为了安全限制, 把最后一层节点搜索上限限制在80w.
+
+搜索200w的输入:
+
+```
+5
+-1 -1 -1 -1
+0 0 0 1
+0 6 1 6
+0 0 1 0
+6 0 6 1
+0 1 0 2
+6 1 5 0
+0 2 0 3
+1 6 3 4
+
+```
+
+用这个作为新的压力测试, 目前见到的最高搜索数
+
+### 4.25 绞尽脑汁了
+
+尝试了很多方式, 也询问了AI, 筛选了一些方法来使用, 都表现不好,,快要到截止日期了, 交给钟姐加入时间限制了, 目前的方法的我的能力应该只能修改到这样了
+
+### 4.26 优化出来了一版
+
+钟姐加入了时间限制, 倒是不会超时了, 可以交了, 但是还有瑕疵
+
+有一个问题是, 这个时间限制有时候会让我的bot走完全无意义的步(无翻转无友方的跳跃走法), 我认为原因是 -- 现在的negamax可以看成是一个dfs的递归, 但是目前的时间限制只是单纯的返回, 并不代表它一定可以返回并且更新最优解, 我需要把这个优化掉..
+
+> 目前的任务:
+> 
+> * 把时间限制的犯蠢优化掉
+
+### 4.27 交了, 完结
+
+优化掉了时间限制的犯蠢部分, 在最后加了一个終局优化, 不知道效果如何, 但是交了..好累...
